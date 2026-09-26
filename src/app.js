@@ -2,8 +2,11 @@
 
 const crypto = require('node:crypto');
 const {
+  PROTOCOL_VERSION,
   generateSeed,
   commitmentFor,
+  candidateSnapshotDigest,
+  commitmentV2,
   secretHash,
   aggregateNonce,
   computeOrder,
@@ -93,11 +96,15 @@ function publicView(row, participantRows) {
     drawId: row.id,
     mode: row.mode,
     status: row.status,
+    version: row.protocol_version,
     commitment: row.commitment,
     candidates: JSON.parse(row.candidates),
     count: row.draw_count,
     createdAt: row.created_at,
   };
+  if (row.protocol_version >= 2) {
+    view.snapshotDigest = row.snapshot_digest;
+  }
 
   if (row.mode === 'multiparty') {
     const revealed = row.status === 'revealed';
@@ -136,8 +143,9 @@ function buildApp(db, opts = {}) {
   const app = require('fastify')({ logger: opts.logger !== undefined ? opts.logger : true });
 
   const insertDraw = db.prepare(
-    `INSERT INTO draws (id, mode, status, commitment, seed, candidates, draw_count, created_at)
-     VALUES (?, ?, 'pending', ?, ?, ?, ?, ?)`
+    `INSERT INTO draws (id, mode, status, commitment, seed, candidates, draw_count,
+                        created_at, protocol_version, snapshot_digest)
+     VALUES (?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?)`
   );
   const insertParticipant = db.prepare(
     `INSERT INTO participants (draw_id, position, name) VALUES (?, ?, ?)`
@@ -212,13 +220,19 @@ function buildApp(db, opts = {}) {
 
     const id = crypto.randomUUID();
     const seed = generateSeed();
-    const commitment = commitmentFor(seed);
+    // v2: the commitment binds the seed to the exact candidate snapshot —
+    // original order, raw UTF-8 byte content and count.
+    const snapshotDigest = candidateSnapshotDigest(candidates, count);
+    const commitment = commitmentV2(seed, snapshotDigest);
     const createdAt = new Date().toISOString();
     const mode = Array.isArray(participants) ? 'multiparty' : 'single';
 
     db.exec('BEGIN IMMEDIATE');
     try {
-      insertDraw.run(id, mode, commitment, seed, JSON.stringify(candidates), count, createdAt);
+      insertDraw.run(
+        id, mode, commitment, seed, JSON.stringify(candidates), count, createdAt,
+        PROTOCOL_VERSION, snapshotDigest
+      );
       if (mode === 'multiparty') {
         participants.forEach((name, position) => insertParticipant.run(id, position, name));
       }
@@ -233,7 +247,9 @@ function buildApp(db, opts = {}) {
       drawId: id,
       mode,
       status: 'pending',
+      version: PROTOCOL_VERSION,
       commitment,
+      snapshotDigest,
       count,
       candidateCount: candidates.length,
       createdAt,
@@ -307,6 +323,7 @@ function buildApp(db, opts = {}) {
         drawId: row.id,
         mode: row.mode,
         status: 'revealed',
+        version: row.protocol_version,
         commitment: row.commitment,
         seed: row.seed,
         nonce,
@@ -316,6 +333,7 @@ function buildApp(db, opts = {}) {
         winners,
         createdAt: row.created_at,
         revealedAt,
+        ...(row.protocol_version >= 2 ? { snapshotDigest: row.snapshot_digest } : {}),
       });
     } catch (err) {
       try { db.exec('ROLLBACK'); } catch { /* no active transaction */ }
@@ -532,6 +550,7 @@ function buildApp(db, opts = {}) {
     const stored = JSON.parse(row.result);
     const participantRows = row.mode === 'multiparty' ? getParticipants.all(row.id) : [];
     const input = {
+      version: row.protocol_version,
       commitment: row.commitment,
       seed: row.seed,
       nonce: row.nonce,
@@ -539,6 +558,7 @@ function buildApp(db, opts = {}) {
       count: row.draw_count,
       order: stored.order,
       winners: stored.winners,
+      ...(row.protocol_version >= 2 ? { snapshotDigest: row.snapshot_digest } : {}),
     };
     if (row.mode === 'multiparty') {
       input.contributions = participantRows
@@ -567,7 +587,9 @@ function buildApp(db, opts = {}) {
         required: ['commitment', 'seed', 'nonce', 'candidates', 'count'],
         additionalProperties: false,
         properties: {
+          version: { type: 'integer', enum: [1, 2] },
           commitment: { type: 'string', minLength: 1 },
+          snapshotDigest: { type: 'string', pattern: '^[0-9a-f]{64}$' },
           seed: { type: 'string', minLength: 1 },
           nonce: { type: 'string', minLength: 1, maxLength: MAX_PARTICIPANTS * 64 },
           candidates: candidateListSchema,
@@ -598,17 +620,27 @@ function buildApp(db, opts = {}) {
   return app;
 }
 
-function verifyRecord({ commitment, seed, nonce, candidates, count, order, winners, contributions }) {
+function verifyRecord({
+  version,
+  commitment,
+  snapshotDigest,
+  seed,
+  nonce,
+  candidates,
+  count,
+  order,
+  winners,
+  contributions,
+}) {
   const problems = [];
   const checks = {};
 
-  // 1. Commitment must match the revealed seed.
-  checks.commitmentMatch = commitmentFor(seed) === commitment;
-  if (!checks.commitmentMatch) {
-    problems.push('commitment mismatch: SHA-256(seed) != commitment — seed 或 commitment 已被篡改');
-  }
+  // No version supplied => legacy v1 verification, so old records and old
+  // verification clients keep working unchanged.
+  const protocolVersion = version === 2 ? 2 : 1;
 
-  // 2. Candidate snapshot sanity: unique, and count within range.
+  // 1. Snapshot sanity: unique candidates, count within range. Run first so
+  //    the v2 snapshot digest below is only recomputed on a sane snapshot.
   const seen = new Set(candidates);
   checks.candidatesUnique = seen.size === candidates.length;
   if (!checks.candidatesUnique) {
@@ -617,6 +649,32 @@ function verifyRecord({ commitment, seed, nonce, candidates, count, order, winne
   checks.countInRange = Number.isInteger(count) && count >= 1 && count <= candidates.length;
   if (!checks.countInRange) {
     problems.push('count mismatch: 抽取数量超出候选范围 — count 已被篡改');
+  }
+
+  // 2. Commitment must match the revealed seed under the draw's protocol:
+  //    v1: SHA-256(seed)
+  //    v2: SHA-256('v2:' + seed + ':' + snapshotDigest(candidates, count))
+  if (protocolVersion === 2) {
+    checks.snapshotDigestMatch =
+      typeof snapshotDigest === 'string'
+      && /^[0-9a-f]{64}$/.test(snapshotDigest)
+      && candidateSnapshotDigest(candidates, count) === snapshotDigest;
+    if (!checks.snapshotDigestMatch) {
+      problems.push('snapshot digest mismatch: 候选顺序、内容或 count 与创建时快照不一致 — candidates/count/snapshotDigest 已被篡改');
+    }
+
+    const digestForCommitment = checks.snapshotDigestMatch
+      ? snapshotDigest
+      : candidateSnapshotDigest(candidates, count);
+    checks.commitmentMatch = commitmentV2(seed, digestForCommitment) === commitment;
+    if (!checks.commitmentMatch) {
+      problems.push("commitment mismatch: SHA-256('v2:'+seed+':'+snapshotDigest) != commitment — seed、commitment 或候选快照已被篡改");
+    }
+  } else {
+    checks.commitmentMatch = commitmentFor(seed) === commitment;
+    if (!checks.commitmentMatch) {
+      problems.push('commitment mismatch: SHA-256(seed) != commitment — seed 或 commitment 已被篡改');
+    }
   }
 
   // 3. Multi-party audit trail: every revealed secret must open its
@@ -668,6 +726,7 @@ function verifyRecord({ commitment, seed, nonce, candidates, count, order, winne
   }
 
   return {
+    version: protocolVersion,
     valid: problems.length === 0,
     checks,
     expected: { order: expectedOrder, winners: expectedWinners },

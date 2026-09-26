@@ -6,17 +6,19 @@ const { DatabaseSync } = require('node:sqlite');
 
 const DRAWS_TABLE = `
   CREATE TABLE IF NOT EXISTS draws (
-    id          TEXT PRIMARY KEY,
-    mode        TEXT NOT NULL DEFAULT 'single' CHECK (mode IN ('single', 'multiparty')),
-    status      TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'committed', 'revealed')),
-    commitment  TEXT NOT NULL,
-    seed        TEXT NOT NULL,
-    nonce       TEXT,
-    candidates  TEXT NOT NULL,
-    draw_count  INTEGER NOT NULL,
-    result      TEXT,
-    created_at  TEXT NOT NULL,
-    revealed_at TEXT
+    id              TEXT PRIMARY KEY,
+    mode            TEXT NOT NULL DEFAULT 'single' CHECK (mode IN ('single', 'multiparty')),
+    status          TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'committed', 'revealed')),
+    commitment      TEXT NOT NULL,
+    seed            TEXT NOT NULL,
+    nonce           TEXT,
+    candidates      TEXT NOT NULL,
+    draw_count      INTEGER NOT NULL,
+    result          TEXT,
+    created_at      TEXT NOT NULL,
+    revealed_at     TEXT,
+    protocol_version INTEGER NOT NULL DEFAULT 2,
+    snapshot_digest TEXT
   );
 `;
 
@@ -53,14 +55,31 @@ function migrateV0ToV1(db) {
   db.exec(DRAWS_TABLE);
   db.exec(`
     INSERT INTO draws (id, mode, status, commitment, seed, nonce, candidates,
-                       draw_count, result, created_at, revealed_at)
+                       draw_count, result, created_at, revealed_at,
+                       protocol_version, snapshot_digest)
     SELECT id, 'single', status, commitment, seed, nonce, candidates,
-           draw_count, result, created_at, revealed_at
+           draw_count, result, created_at, revealed_at, 1, NULL
       FROM draws_legacy;
   `);
   db.exec('DROP TABLE draws_legacy;');
   db.exec('COMMIT;');
   db.exec('PRAGMA foreign_keys = ON;');
+}
+
+// v1 -> v2: persist the protocol version and the v2 candidate-snapshot digest
+// alongside every draw. New draws are v2; existing rows stay NULL-digest v1
+// and keep being verified with the legacy commitment SHA-256(seed).
+function migrateV1ToV2(db) {
+  const columns = new Set(
+    db.prepare('PRAGMA table_info(draws)').all().map((c) => c.name)
+  );
+  if (!columns.has('protocol_version')) {
+    // Constant default makes the ADD COLUMN legal for non-empty tables.
+    db.exec('ALTER TABLE draws ADD COLUMN protocol_version INTEGER NOT NULL DEFAULT 1;');
+  }
+  if (!columns.has('snapshot_digest')) {
+    db.exec('ALTER TABLE draws ADD COLUMN snapshot_digest TEXT;');
+  }
 }
 
 // Opens (creating if needed) the SQLite database and ensures the schema exists.
@@ -80,6 +99,12 @@ function openDatabase(dbPath) {
   if (version < 1) {
     migrateV0ToV1(db);
     db.exec('PRAGMA user_version = 1;');
+  }
+  if (version < 2) {
+    // A v0->v1 rebuild above already carries the v2 columns; this only adds
+    // them to databases that already existed at v1.
+    migrateV1ToV2(db);
+    db.exec('PRAGMA user_version = 2;');
   }
   db.exec(PARTICIPANTS_TABLE);
   db.exec(PARTICIPANTS_INDEX);

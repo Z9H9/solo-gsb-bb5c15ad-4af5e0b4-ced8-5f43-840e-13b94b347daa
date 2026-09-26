@@ -15,8 +15,41 @@ function generateSeed() {
 }
 
 // commitment = SHA-256(seed), where seed is the UTF-8 hex string.
+// This is the legacy v1 commitment, kept so draws created before the v2
+// candidate-snapshot protocol stay verifiable forever.
 function commitmentFor(seed) {
   return sha256Hex(seed);
+}
+
+// Protocol version used by every newly created draw.
+//   v1: commitment = SHA-256(seed)
+//   v2: commitment = SHA-256('v2:' + seed + ':' + snapshotDigest)
+const PROTOCOL_VERSION = 2;
+
+// v2 candidate snapshot, encoded in the original candidate order as:
+//   <count decimal>'\n' for each candidate: '<UTF-8 byte length>:'<raw UTF-8 bytes>
+// i.e. the only separator is the single newline between count and the list;
+// items are length-framed ('<len>:') so the encoding stays unambiguous even
+// when a candidate itself contains digits, ':' or newlines. Hashing the raw
+// UTF-8 bytes makes the digest sensitive to byte content and order, not just
+// JS code units, and the count is covered as well.
+function encodeCandidateSnapshot(candidates, count) {
+  const chunks = [Buffer.from(String(count), 'utf8'), Buffer.from('\n', 'utf8')];
+  for (const candidate of candidates) {
+    const bytes = Buffer.from(candidate, 'utf8');
+    chunks.push(Buffer.from(`${bytes.length}:`, 'utf8'), bytes);
+  }
+  return Buffer.concat(chunks);
+}
+
+function candidateSnapshotDigest(candidates, count) {
+  return crypto.createHash('sha256').update(encodeCandidateSnapshot(candidates, count)).digest('hex');
+}
+
+// v2 commitment: binds the revealed seed to the exact candidate snapshot
+// (order, byte content and count).
+function commitmentV2(seed, snapshotDigest) {
+  return sha256Hex(`v2:${seed}:${snapshotDigest}`);
 }
 
 // A participant commits to SHA-256(secret) before revealing the secret.
@@ -79,8 +112,12 @@ function computeOrder(seed, nonce, candidates) {
 
 module.exports = {
   sha256Hex,
+  PROTOCOL_VERSION,
   generateSeed,
   commitmentFor,
+  encodeCandidateSnapshot,
+  candidateSnapshotDigest,
+  commitmentV2,
   secretHash,
   aggregateNonce,
   computeOrder,

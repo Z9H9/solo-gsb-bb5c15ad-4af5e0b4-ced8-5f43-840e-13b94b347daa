@@ -7,6 +7,8 @@ const { buildApp } = require('../src/app');
 const {
   sha256Hex,
   commitmentFor,
+  commitmentV2,
+  candidateSnapshotDigest,
   secretHash,
   aggregateNonce,
   computeOrder,
@@ -57,6 +59,8 @@ test('create with participants fixes the participant order and starts in commitm
   const created = await createMultiparty(app);
   assert.equal(created.mode, 'multiparty');
   assert.equal(created.status, 'pending');
+  assert.equal(created.version, 2);
+  assert.equal(created.snapshotDigest, candidateSnapshotDigest(CANDIDATES, 2));
   assert.deepEqual(
     created.participants.map((p) => p.name),
     NAMES
@@ -69,6 +73,8 @@ test('create with participants fixes the participant order and starts in commitm
 
   const shown = (await app.inject({ method: 'GET', url: `/draws/${created.drawId}` })).json();
   assert.equal(shown.mode, 'multiparty');
+  assert.equal(shown.version, 2);
+  assert.equal(shown.snapshotDigest, created.snapshotDigest);
   assert.equal(shown.committedCount, 0);
   assert.equal(shown.revealedCount, 0);
   // No commitment values or secrets are exposed before they are submitted.
@@ -101,7 +107,13 @@ test('full multi-party flow aggregates secret hashes in fixed order', async () =
 
   const final = r1.json();
   assert.equal(final.status, 'revealed');
-  assert.equal(commitmentFor(final.seed), created.commitment);
+  assert.equal(final.version, 2);
+  assert.equal(final.snapshotDigest, created.snapshotDigest);
+  assert.equal(
+    commitmentV2(final.seed, candidateSnapshotDigest(CANDIDATES, 2)),
+    created.commitment
+  );
+  assert.notEqual(commitmentFor(final.seed), created.commitment, 'v2 commitment differs from legacy SHA-256(seed)');
 
   // nonce = concat of SHA-256(secret) in the declared participant order.
   const expectedNonce = aggregateNonce(NAMES.map((n) => SECRETS[n]));
@@ -232,6 +244,8 @@ test('stored verify checks the multi-party contribution trail', async () => {
   })).json();
   assert.equal(report.mode, 'multiparty');
   assert.equal(report.valid, true);
+  assert.equal(report.version, 2);
+  assert.equal(report.checks.snapshotDigestMatch, true);
   assert.equal(report.checks.commitmentsOpen, true);
   assert.equal(report.checks.nonceDerived, true);
   assert.equal(report.checks.positionsComplete, true);
@@ -249,7 +263,9 @@ test('independent verify flags tampered multi-party contributions', async () => 
   assert.equal(final.status, 'revealed');
 
   const base = {
+    version: 2,
     commitment: final.commitment,
+    snapshotDigest: final.snapshotDigest,
     seed: final.seed,
     nonce: final.nonce,
     candidates: CANDIDATES,
@@ -258,6 +274,21 @@ test('independent verify flags tampered multi-party contributions', async () => 
     winners: final.winners,
     contributions: final.contributions,
   };
+
+  // Reordering the candidate snapshot breaks the v2 commitment.
+  const reorderedCandidates = {
+    ...base,
+    candidates: CANDIDATES.slice().reverse(),
+    order: undefined,
+    winners: undefined,
+  };
+  const rep0 = (await app.inject({ method: 'POST', url: '/verify', payload: reorderedCandidates })).json();
+  assert.equal(rep0.valid, false);
+  assert.equal(rep0.checks.snapshotDigestMatch, false);
+  assert.equal(rep0.checks.commitmentMatch, false);
+  // Contributions alone still open correctly; the failure is the snapshot, not the entropy trail.
+  assert.equal(rep0.checks.commitmentsOpen, true);
+  assert.equal(rep0.checks.nonceDerived, true);
 
   // Tamper one secret but keep the commitment: commitmentsOpen fails.
   const tamperedSecret = {
@@ -290,6 +321,79 @@ test('independent verify flags tampered multi-party contributions', async () => 
   assert.equal(ok.checks.commitmentsOpen, true);
   assert.equal(ok.checks.nonceDerived, true);
   assert.equal(ok.checks.orderMatch, true);
+  assert.equal(ok.checks.snapshotDigestMatch, true);
+});
+
+// A multi-party draw row created before v2: legacy SHA-256(seed) commitment,
+// no snapshot digest. It must stay queryable and verify with the old algorithm.
+test('legacy v1 multi-party records remain queryable and verifiable', async () => {
+  const { db, app } = makeApp();
+  const seed = 'c'.repeat(64);
+  const nonce = aggregateNonce(NAMES.map((n) => SECRETS[n]));
+  const order = computeOrder(seed, nonce, CANDIDATES);
+  const winners = order.slice(0, 2);
+  const createdAt = '2026-01-01T00:00:00.000Z';
+  const revealedAt = '2026-01-02T00:00:00.000Z';
+  db.prepare(
+    `INSERT INTO draws (id, mode, status, commitment, seed, nonce, candidates,
+                        draw_count, result, created_at, revealed_at,
+                        protocol_version, snapshot_digest)
+     VALUES (?, 'multiparty', 'revealed', ?, ?, ?, ?, ?, ?, ?, ?, 1, NULL)`
+  ).run(
+    'legacy-multi', commitmentFor(seed), seed, nonce,
+    JSON.stringify(CANDIDATES), 2,
+    JSON.stringify({ order, winners }), createdAt, revealedAt
+  );
+  const insertParticipant = db.prepare(
+    `INSERT INTO participants (draw_id, position, name, commitment, secret,
+                               committed_at, revealed_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?)`
+  );
+  NAMES.forEach((name, position) => {
+    insertParticipant.run(
+      'legacy-multi', position, name,
+      secretHash(SECRETS[name]), SECRETS[name], createdAt, revealedAt
+    );
+  });
+
+  const shown = await app.inject({ method: 'GET', url: '/draws/legacy-multi' });
+  assert.equal(shown.statusCode, 200);
+  assert.equal(shown.json().version, 1);
+  assert.equal(shown.json().snapshotDigest, undefined);
+  assert.equal(shown.json().commitment, commitmentFor(seed));
+
+  const stored = await app.inject({ method: 'GET', url: '/draws/legacy-multi/verify' });
+  assert.equal(stored.statusCode, 200);
+  const report = stored.json();
+  assert.equal(report.version, 1);
+  assert.equal(report.valid, true);
+  assert.equal(report.checks.commitmentMatch, true);
+  assert.equal(report.checks.commitmentsOpen, true);
+  assert.equal(report.checks.nonceDerived, true);
+  assert.equal(report.checks.orderMatch, true);
+  assert.equal(report.checks.snapshotDigestMatch, undefined);
+
+  const independent = await app.inject({
+    method: 'POST',
+    url: '/verify',
+    payload: {
+      commitment: commitmentFor(seed),
+      seed,
+      nonce,
+      candidates: CANDIDATES,
+      count: 2,
+      order,
+      winners,
+      contributions: NAMES.map((name, position) => ({
+        name,
+        position,
+        commitment: secretHash(SECRETS[name]),
+        secret: SECRETS[name],
+      })),
+    },
+  });
+  assert.equal(independent.json().valid, true);
+  assert.equal(independent.json().version, 1);
 });
 
 test('participant list validation at creation', async () => {
