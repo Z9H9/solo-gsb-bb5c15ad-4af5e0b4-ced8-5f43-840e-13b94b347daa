@@ -6,17 +6,19 @@ const { DatabaseSync } = require('node:sqlite');
 
 const DRAWS_TABLE = `
   CREATE TABLE IF NOT EXISTS draws (
-    id          TEXT PRIMARY KEY,
-    mode        TEXT NOT NULL DEFAULT 'single' CHECK (mode IN ('single', 'multiparty')),
-    status      TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'committed', 'revealed')),
-    commitment  TEXT NOT NULL,
-    seed        TEXT NOT NULL,
-    nonce       TEXT,
-    candidates  TEXT NOT NULL,
-    draw_count  INTEGER NOT NULL,
-    result      TEXT,
-    created_at  TEXT NOT NULL,
-    revealed_at TEXT
+    id               TEXT PRIMARY KEY,
+    mode             TEXT NOT NULL DEFAULT 'single' CHECK (mode IN ('single', 'multiparty')),
+    status           TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'committed', 'revealed')),
+    commitment       TEXT NOT NULL,
+    seed             TEXT NOT NULL,
+    nonce            TEXT,
+    candidates       TEXT NOT NULL,
+    draw_count       INTEGER NOT NULL,
+    result           TEXT,
+    created_at       TEXT NOT NULL,
+    revealed_at      TEXT,
+    protocol_version TEXT,
+    snapshot_digest  TEXT
   );
 `;
 
@@ -63,6 +65,19 @@ function migrateV0ToV1(db) {
   db.exec('PRAGMA foreign_keys = ON;');
 }
 
+// v2 draws bind the candidate snapshot (order, content, count) into the
+// commitment. The new columns stay NULL for pre-v2 rows, which keeps them on
+// the legacy v1 verification path.
+function migrateV1ToV2(db) {
+  const columns = db.prepare('PRAGMA table_info(draws)').all().map((c) => c.name);
+  if (!columns.includes('protocol_version')) {
+    db.exec('ALTER TABLE draws ADD COLUMN protocol_version TEXT');
+  }
+  if (!columns.includes('snapshot_digest')) {
+    db.exec('ALTER TABLE draws ADD COLUMN snapshot_digest TEXT');
+  }
+}
+
 // Opens (creating if needed) the SQLite database and ensures the schema exists.
 function openDatabase(dbPath) {
   if (dbPath !== ':memory:') {
@@ -80,6 +95,10 @@ function openDatabase(dbPath) {
   if (version < 1) {
     migrateV0ToV1(db);
     db.exec('PRAGMA user_version = 1;');
+  }
+  if (version < 2) {
+    migrateV1ToV2(db);
+    db.exec('PRAGMA user_version = 2;');
   }
   db.exec(PARTICIPANTS_TABLE);
   db.exec(PARTICIPANTS_INDEX);

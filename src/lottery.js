@@ -4,6 +4,12 @@ const crypto = require('node:crypto');
 
 const UINT32_SPACE = 0x100000000; // 2^32
 
+// Commitment protocol versions. Records created before v2 carry no version
+// marker and are always verified with the legacy v1 formula.
+const PROTOCOL_V1 = 'v1';
+const PROTOCOL_V2 = 'v2';
+const LATEST_PROTOCOL_VERSION = PROTOCOL_V2;
+
 function sha256Hex(input) {
   return crypto.createHash('sha256').update(input, 'utf8').digest('hex');
 }
@@ -14,9 +20,33 @@ function generateSeed() {
   return crypto.randomBytes(32).toString('hex');
 }
 
-// commitment = SHA-256(seed), where seed is the UTF-8 hex string.
+// Legacy v1 commitment = SHA-256(seed), where seed is the UTF-8 hex string.
 function commitmentFor(seed) {
   return sha256Hex(seed);
+}
+
+// Canonical candidate snapshot serialization, in the original order:
+//   "<count as decimal>\n" followed by "<utf8 byte length>:<original bytes>"
+//   for every candidate, concatenated with no extra separators. The length
+//   prefix makes the concatenation unambiguous (it survives multibyte UTF-8),
+//   so the resulting digest binds candidate order, content and count.
+function snapshotDigestFor(candidates, count) {
+  let snapshot = `${count}\n`;
+  for (const candidate of candidates) {
+    snapshot += `${Buffer.byteLength(candidate, 'utf8')}:${candidate}`;
+  }
+  return sha256Hex(snapshot);
+}
+
+// Versioned draw commitment:
+//   v1: SHA-256(seed)
+//   v2: SHA-256("v2:<seed>:<snapshotDigest>")
+// Anything that is not v2 verifies with the legacy v1 formula.
+function commitmentForVersion(version, seed, snapshotDigest) {
+  if (version === PROTOCOL_V2) {
+    return sha256Hex(`${PROTOCOL_V2}:${seed}:${snapshotDigest}`);
+  }
+  return commitmentFor(seed);
 }
 
 // A participant commits to SHA-256(secret) before revealing the secret.
@@ -81,7 +111,12 @@ module.exports = {
   sha256Hex,
   generateSeed,
   commitmentFor,
+  commitmentForVersion,
+  snapshotDigestFor,
   secretHash,
   aggregateNonce,
   computeOrder,
+  PROTOCOL_V1,
+  PROTOCOL_V2,
+  LATEST_PROTOCOL_VERSION,
 };

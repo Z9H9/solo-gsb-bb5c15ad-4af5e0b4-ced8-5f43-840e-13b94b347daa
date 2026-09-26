@@ -4,7 +4,7 @@ const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const { openDatabase } = require('../src/db');
 const { buildApp } = require('../src/app');
-const { commitmentFor, computeOrder } = require('../src/lottery');
+const { commitmentForVersion, computeOrder } = require('../src/lottery');
 
 function makeApp() {
   const db = openDatabase(':memory:');
@@ -46,7 +46,7 @@ test('reveal is single-shot and reproducible', async () => {
   });
   assert.equal(reveal.statusCode, 200);
   const r = reveal.json();
-  assert.equal(commitmentFor(r.seed), created.commitment);
+  assert.equal(commitmentForVersion(r.version, r.seed, r.snapshotDigest), created.commitment);
   assert.deepEqual(r.order, computeOrder(r.seed, r.nonce, CANDIDATES));
   assert.deepEqual(r.winners, r.order.slice(0, 2));
 
@@ -72,6 +72,8 @@ test('independent verify accepts honest records and flags tampering', async () =
   })).json();
 
   const record = {
+    version: revealed.version,
+    snapshotDigest: revealed.snapshotDigest,
     commitment: revealed.commitment,
     seed: revealed.seed,
     nonce: revealed.nonce,

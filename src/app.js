@@ -3,10 +3,14 @@
 const crypto = require('node:crypto');
 const {
   generateSeed,
-  commitmentFor,
+  commitmentForVersion,
+  snapshotDigestFor,
   secretHash,
   aggregateNonce,
   computeOrder,
+  PROTOCOL_V1,
+  PROTOCOL_V2,
+  LATEST_PROTOCOL_VERSION,
 } = require('./lottery');
 
 const MAX_CANDIDATES = 10000;
@@ -93,7 +97,9 @@ function publicView(row, participantRows) {
     drawId: row.id,
     mode: row.mode,
     status: row.status,
+    version: row.protocol_version || PROTOCOL_V1,
     commitment: row.commitment,
+    snapshotDigest: row.snapshot_digest,
     candidates: JSON.parse(row.candidates),
     count: row.draw_count,
     createdAt: row.created_at,
@@ -136,8 +142,9 @@ function buildApp(db, opts = {}) {
   const app = require('fastify')({ logger: opts.logger !== undefined ? opts.logger : true });
 
   const insertDraw = db.prepare(
-    `INSERT INTO draws (id, mode, status, commitment, seed, candidates, draw_count, created_at)
-     VALUES (?, ?, 'pending', ?, ?, ?, ?, ?)`
+    `INSERT INTO draws (id, mode, status, commitment, seed, candidates, draw_count, created_at,
+                        protocol_version, snapshot_digest)
+     VALUES (?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?)`
   );
   const insertParticipant = db.prepare(
     `INSERT INTO participants (draw_id, position, name) VALUES (?, ?, ?)`
@@ -173,7 +180,7 @@ function buildApp(db, opts = {}) {
 
   app.get('/', async () => ({
     name: 'verifiable-draw',
-    description: 'Commit-reveal public draw with SHA-256 rejection-sampling Fisher-Yates',
+    description: 'Commit-reveal public draw with snapshot-bound v2 commitments and SHA-256 rejection-sampling Fisher-Yates',
     endpoints: {
       create: 'POST /draws',
       reveal: 'POST /draws/:id/reveal',
@@ -212,13 +219,19 @@ function buildApp(db, opts = {}) {
 
     const id = crypto.randomUUID();
     const seed = generateSeed();
-    const commitment = commitmentFor(seed);
+    // v2: the commitment also binds the exact candidate snapshot, so the
+    // published commitment is SHA-256("v2:<seed>:<snapshotDigest>").
+    const snapshotDigest = snapshotDigestFor(candidates, count);
+    const commitment = commitmentForVersion(LATEST_PROTOCOL_VERSION, seed, snapshotDigest);
     const createdAt = new Date().toISOString();
     const mode = Array.isArray(participants) ? 'multiparty' : 'single';
 
     db.exec('BEGIN IMMEDIATE');
     try {
-      insertDraw.run(id, mode, commitment, seed, JSON.stringify(candidates), count, createdAt);
+      insertDraw.run(
+        id, mode, commitment, seed, JSON.stringify(candidates), count, createdAt,
+        LATEST_PROTOCOL_VERSION, snapshotDigest
+      );
       if (mode === 'multiparty') {
         participants.forEach((name, position) => insertParticipant.run(id, position, name));
       }
@@ -228,12 +241,15 @@ function buildApp(db, opts = {}) {
       throw err;
     }
 
-    // Only the server-side commitment is returned; the seed stays hidden.
+    // Only the commitment and the snapshot digest are returned; the seed
+    // stays hidden until reveal.
     const response = {
       drawId: id,
       mode,
       status: 'pending',
+      version: LATEST_PROTOCOL_VERSION,
       commitment,
+      snapshotDigest,
       count,
       candidateCount: candidates.length,
       createdAt,
@@ -307,7 +323,9 @@ function buildApp(db, opts = {}) {
         drawId: row.id,
         mode: row.mode,
         status: 'revealed',
+        version: row.protocol_version || PROTOCOL_V1,
         commitment: row.commitment,
+        snapshotDigest: row.snapshot_digest,
         seed: row.seed,
         nonce,
         candidates,
@@ -532,6 +550,8 @@ function buildApp(db, opts = {}) {
     const stored = JSON.parse(row.result);
     const participantRows = row.mode === 'multiparty' ? getParticipants.all(row.id) : [];
     const input = {
+      version: row.protocol_version || PROTOCOL_V1,
+      snapshotDigest: row.snapshot_digest === null ? undefined : row.snapshot_digest,
       commitment: row.commitment,
       seed: row.seed,
       nonce: row.nonce,
@@ -558,6 +578,8 @@ function buildApp(db, opts = {}) {
   // ---- Independent verification ------------------------------------------
   // Recompute everything from the commitment, nonce and candidate snapshot;
   // any supplied field that disagrees with the recomputation is tampered.
+  // `version` selects the commitment formula ('v2' recomputes the snapshot
+  // digest from candidates/count; absent means the legacy v1 algorithm).
   // For multi-party draws, `contributions` (in participant order) lets the
   // caller prove the nonce was really derived from the revealed secrets.
   app.post('/verify', {
@@ -567,6 +589,8 @@ function buildApp(db, opts = {}) {
         required: ['commitment', 'seed', 'nonce', 'candidates', 'count'],
         additionalProperties: false,
         properties: {
+          version: { type: 'string', enum: [PROTOCOL_V1, PROTOCOL_V2] },
+          snapshotDigest: { type: 'string', pattern: '^[0-9a-f]{64}$' },
           commitment: { type: 'string', minLength: 1 },
           seed: { type: 'string', minLength: 1 },
           nonce: { type: 'string', minLength: 1, maxLength: MAX_PARTICIPANTS * 64 },
@@ -598,14 +622,31 @@ function buildApp(db, opts = {}) {
   return app;
 }
 
-function verifyRecord({ commitment, seed, nonce, candidates, count, order, winners, contributions }) {
+function verifyRecord({ commitment, seed, nonce, candidates, count, order, winners, contributions, version, snapshotDigest }) {
   const problems = [];
   const checks = {};
+  // Records without a version marker verify with the legacy v1 algorithm.
+  const protocol = version === PROTOCOL_V2 ? PROTOCOL_V2 : PROTOCOL_V1;
 
-  // 1. Commitment must match the revealed seed.
-  checks.commitmentMatch = commitmentFor(seed) === commitment;
+  // 1. Commitment must match the revealed seed under the record's protocol
+  //    version. v2 also binds the candidate snapshot: the digest is recomputed
+  //    from the supplied candidates/count, so any change to candidate order,
+  //    content or count breaks the commitment check.
+  let expectedSnapshotDigest;
+  if (protocol === PROTOCOL_V2) {
+    expectedSnapshotDigest = snapshotDigestFor(candidates, count);
+    if (snapshotDigest !== undefined) {
+      checks.snapshotDigestMatch = snapshotDigest === expectedSnapshotDigest;
+      if (!checks.snapshotDigestMatch) {
+        problems.push('snapshot digest mismatch: 候选快照摘要与 candidates/count 重算结果不一致 — 候选顺序、内容或 count 已被篡改');
+      }
+    }
+  }
+  checks.commitmentMatch = commitmentForVersion(protocol, seed, expectedSnapshotDigest) === commitment;
   if (!checks.commitmentMatch) {
-    problems.push('commitment mismatch: SHA-256(seed) != commitment — seed 或 commitment 已被篡改');
+    problems.push(protocol === PROTOCOL_V2
+      ? 'commitment mismatch: SHA-256(v2:seed:快照摘要) != commitment — seed、commitment 或候选快照已被篡改'
+      : 'commitment mismatch: SHA-256(seed) != commitment — seed 或 commitment 已被篡改');
   }
 
   // 2. Candidate snapshot sanity: unique, and count within range.
@@ -669,6 +710,8 @@ function verifyRecord({ commitment, seed, nonce, candidates, count, order, winne
 
   return {
     valid: problems.length === 0,
+    version: protocol,
+    ...(expectedSnapshotDigest !== undefined ? { snapshotDigest: expectedSnapshotDigest } : {}),
     checks,
     expected: { order: expectedOrder, winners: expectedWinners },
     problems,

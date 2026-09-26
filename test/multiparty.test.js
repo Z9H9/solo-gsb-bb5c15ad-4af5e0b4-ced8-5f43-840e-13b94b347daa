@@ -6,7 +6,7 @@ const { openDatabase } = require('../src/db');
 const { buildApp } = require('../src/app');
 const {
   sha256Hex,
-  commitmentFor,
+  commitmentForVersion,
   secretHash,
   aggregateNonce,
   computeOrder,
@@ -101,7 +101,7 @@ test('full multi-party flow aggregates secret hashes in fixed order', async () =
 
   const final = r1.json();
   assert.equal(final.status, 'revealed');
-  assert.equal(commitmentFor(final.seed), created.commitment);
+  assert.equal(commitmentForVersion(final.version, final.seed, final.snapshotDigest), created.commitment);
 
   // nonce = concat of SHA-256(secret) in the declared participant order.
   const expectedNonce = aggregateNonce(NAMES.map((n) => SECRETS[n]));
@@ -249,6 +249,8 @@ test('independent verify flags tampered multi-party contributions', async () => 
   assert.equal(final.status, 'revealed');
 
   const base = {
+    version: final.version,
+    snapshotDigest: final.snapshotDigest,
     commitment: final.commitment,
     seed: final.seed,
     nonce: final.nonce,
